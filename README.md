@@ -9,6 +9,8 @@ A tiny always-on-top macOS widget that shows how much of your Claude plan is lef
 - **Token usage**: Claude Code tokens in the current 5-hour window and today
 - **Model mix**: share of tokens by Opus / Sonnet / Fable / Haiku
 
+At rest it's a 44 pt circle with two rings: the outer ring is the 5-hour window, the inner ring is the 7-day window, and the number in the middle is the 5-hour % left. Hover over it to expand the full panel. Move the pointer away and it collapses again.
+
 It floats above every window, on every Space and over full-screen apps. It has no Dock icon and no menu bar item. Drag it anywhere and it remembers its position. Right-click it for Refresh, Launch at Login and Quit.
 
 ## Requirements

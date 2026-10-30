@@ -26,8 +26,33 @@ struct ClaudeMeterApp: App {
 
 // MARK: - Window
 
+// Hosting view that (a) lets you drag the window from anywhere and (b) reports
+// hover even though the panel never becomes key (.activeAlways tracking).
 final class DragHostingView<Content: View>: NSHostingView<Content> {
+    var onHover: (@MainActor (Bool) -> Void)?
+    private var area: NSTrackingArea?
+
     override var mouseDownCanMoveWindow: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let a = area { removeTrackingArea(a) }
+        let a = NSTrackingArea(rect: .zero,
+                               options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        addTrackingArea(a)
+        area = a
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        onHover?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        onHover?(false)
+    }
 }
 
 @MainActor
@@ -36,11 +61,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var host: DragHostingView<MeterView>!
     private let store = Store()
     private var bag: AnyCancellable?
+    private var collapseTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon, no menu bar
 
         host = DragHostingView(rootView: MeterView(store: store))
+        host.onHover = { [weak self] inside in self?.hover(inside) }
         let size = host.fittingSize
 
         panel = NSPanel(contentRect: NSRect(origin: .zero, size: size),
@@ -66,18 +93,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in self?.fit() }
         }
         store.start()
+        fit()
     }
 
-    // Resize to content, keeping the top edge fixed.
+    // Expand immediately on hover; collapse after a short grace period so the
+    // widget doesn't flicker when the pointer brushes the edge.
+    private func hover(_ inside: Bool) {
+        collapseTask?.cancel()
+        if inside {
+            if !store.expanded { store.expanded = true }
+        } else {
+            collapseTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard !Task.isCancelled else { return }
+                self?.store.expanded = false
+            }
+        }
+    }
+
+    // Resize to content, keeping the corner nearest the screen corner fixed,
+    // so the panel always grows toward the middle of the screen.
     private func fit() {
         host.layoutSubtreeIfNeeded()
         let size = host.fittingSize
-        var f = panel.frame
+        let f = panel.frame
         guard f.size != size else { return }
-        let top = f.maxY
-        f.size = size
-        f.origin.y = top - size.height
-        panel.setFrame(f, display: true)
+        let vf = (panel.screen ?? NSScreen.main)?.visibleFrame ?? f
+        let anchorRight = f.midX > vf.midX
+        let anchorTop = f.midY > vf.midY
+        var n = NSRect(origin: .zero, size: size)
+        n.origin.x = anchorRight ? f.maxX - size.width : f.minX
+        n.origin.y = anchorTop ? f.maxY - size.height : f.minY
+        n.origin.x = min(max(n.origin.x, vf.minX), vf.maxX - size.width)
+        n.origin.y = min(max(n.origin.y, vf.minY), vf.maxY - size.height)
+        panel.setFrame(n, display: true)
+        panel.invalidateShadow()
     }
 }
 
@@ -160,6 +210,7 @@ final class Store: ObservableObject {
     @Published var status: String?
     @Published var updatedAt: Date?
     @Published var plan: String?
+    @Published var expanded = false
 
     private var token: String?
     private var profileTried = false
@@ -458,41 +509,26 @@ enum LocalLogs {
 // MARK: - UI
 
 private let contentWidth: CGFloat = 230
+private let gaugeSize: CGFloat = 44
+
+func leftColor(_ left: Double) -> Color {
+    left > 50 ? .green : left > 20 ? .orange : .red
+}
 
 struct MeterView: View {
     @ObservedObject var store: Store
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { ctx in
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(verbatim: store.plan ?? "Claude")
-                        .font(.system(size: 12, weight: .semibold))
-                    Spacer(minLength: 0)
-                    Text(verbatim: store.mood.caption)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
+            Group {
+                if store.expanded {
+                    expanded(now: ctx.date)
+                } else {
+                    Gauge(fiveHour: store.windows.first { $0.id == "five_hour" },
+                          sevenDay: store.windows.first { $0.id == "seven_day" },
+                          failed: store.windows.isEmpty && store.status != nil)
                 }
-                ForEach(store.windows) { WindowRow(w: $0, now: ctx.date) }
-                if store.stats.totalDay > 0 {
-                    Divider().opacity(0.5)
-                    ModelShare(s: store.stats)
-                }
-                if let s = store.status {
-                    Text(verbatim: s)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Text(verbatim: "tok  5h \(fmt(store.stats.total5h)) · today \(fmt(store.stats.totalDay))")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .frame(width: contentWidth + 20, alignment: .leading)
-            .background(VisualEffect())
-            .help(store.updatedAt.map { "Updated \($0.formatted(date: .omitted, time: .standard))" } ?? "")
             .contextMenu {
                 Button("Refresh") { store.refresh() }
                 Button(SMAppService.mainApp.status == .enabled ? "✓ Launch at Login" : "Launch at Login") { toggleLogin() }
@@ -502,6 +538,38 @@ struct MeterView: View {
         }
     }
 
+    private func expanded(now: Date) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(verbatim: store.plan ?? "Claude")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer(minLength: 0)
+                Text(verbatim: store.mood.caption)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(store.windows) { WindowRow(w: $0, now: now) }
+            if store.stats.totalDay > 0 {
+                Divider().opacity(0.4)
+                ModelShare(s: store.stats)
+            }
+            if let s = store.status {
+                Text(verbatim: s)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(verbatim: "tok  5h \(fmt(store.stats.total5h)) · today \(fmt(store.stats.totalDay))")
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(width: contentWidth + 20, alignment: .leading)
+        .background(VisualEffect(cornerRadius: 10))
+        .help(store.updatedAt.map { "Updated \($0.formatted(date: .omitted, time: .standard))" } ?? "")
+    }
+
     private func toggleLogin() {
         let s = SMAppService.mainApp
         do {
@@ -509,6 +577,47 @@ struct MeterView: View {
         } catch {
             NSSound.beep()
         }
+    }
+}
+
+// Collapsed state: two concentric rings, filled clockwise by % left.
+// Outer ring = 5h window, inner ring = 7d window, center = 5h % left.
+struct Gauge: View {
+    let fiveHour: UsageWindow?
+    let sevenDay: UsageWindow?
+    let failed: Bool
+
+    var body: some View {
+        ZStack {
+            ring(fiveHour, diameter: 36)
+            ring(sevenDay, diameter: 24)
+            Text(verbatim: center)
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(failed ? Color.secondary : Color.primary)
+        }
+        .frame(width: gaugeSize, height: gaugeSize)
+        .background(VisualEffect(cornerRadius: gaugeSize / 2))
+    }
+
+    private var center: String {
+        if failed { return "!" }
+        guard let w = fiveHour else { return "–" }
+        return "\(Int(left(w).rounded()))"
+    }
+
+    private func left(_ w: UsageWindow) -> Double { min(100, max(0, 100 - w.pct)) }
+
+    private func ring(_ w: UsageWindow?, diameter: CGFloat) -> some View {
+        let l = w.map(left) ?? 0
+        return ZStack {
+            Circle().stroke(Color.primary.opacity(0.15), lineWidth: 4)
+            Circle()
+                .trim(from: 0, to: l / 100)
+                .stroke(leftColor(l), style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: diameter, height: diameter)
     }
 }
 
@@ -531,7 +640,7 @@ struct WindowRow: View {
                 .frame(width: 52, alignment: .leading)
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.primary.opacity(0.15))
-                Capsule().fill(color(left)).frame(width: 56 * left / 100)
+                Capsule().fill(leftColor(left)).frame(width: 56 * left / 100)
             }
             .frame(width: 56, height: 6)
             Text(verbatim: "\(Int(left.rounded()))% left")
@@ -542,10 +651,6 @@ struct WindowRow: View {
         }
         .font(.system(size: 11, weight: .medium, design: .monospaced))
         .lineLimit(1)
-    }
-
-    private func color(_ left: Double) -> Color {
-        left > 50 ? .green : left > 20 ? .orange : .red
     }
 
     private func countdown() -> String {
@@ -559,42 +664,41 @@ struct WindowRow: View {
     }
 }
 
-// Two stacked bars (5h window, today) showing each model family's share of
-// Claude Code tokens, plus a legend with "5h% / today%".
+// Compact model mix: two thin stacked bars (5h, today) and a one-line legend
+// with "5h% / today%" per model family.
 struct ModelShare: View {
     let s: TokenStats
-    private let barWidth: CGFloat = contentWidth - 58
+    private let barWidth: CGFloat = contentWidth - 40
 
     private var present: [String] {
         Family.order.filter { (s.byDay[$0] ?? 0) > 0 || (s.by5h[$0] ?? 0) > 0 }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             bar("5h", s.by5h, s.total5h)
-            bar("today", s.byDay, s.totalDay)
-            LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
-                                GridItem(.flexible(), alignment: .leading)],
-                      alignment: .leading, spacing: 2) {
+            bar("day", s.byDay, s.totalDay)
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4, alignment: .leading), count: 3),
+                      alignment: .leading, spacing: 1) {
                 ForEach(present, id: \.self) { f in
-                    HStack(spacing: 4) {
-                        Circle().fill(Family.color(f)).frame(width: 6, height: 6)
-                        Text(verbatim: "\(f) \(pct(s.by5h[f], s.total5h))/\(pct(s.byDay[f], s.totalDay))")
+                    HStack(spacing: 3) {
+                        Circle().fill(Family.color(f)).frame(width: 5, height: 5)
+                        Text(verbatim: "\(f) \(pct(s.by5h[f], s.total5h))/\(pct(s.byDay[f], s.totalDay))%")
                             .lineLimit(1)
+                            .minimumScaleFactor(0.8)
                     }
                 }
             }
-            .foregroundStyle(.secondary)
         }
-        .font(.system(size: 10, design: .monospaced))
+        .font(.system(size: 9, design: .monospaced))
+        .foregroundStyle(.secondary)
         .help("Share of Claude Code tokens by model (5h / today). Token share ≠ limit share: Opus and Fable tokens count more against limits. claude.ai chats aren't included.")
     }
 
     private func bar(_ label: String, _ by: [String: Int], _ total: Int) -> some View {
         HStack(spacing: 6) {
             Text(verbatim: label)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .frame(width: 52, alignment: .leading)
+                .frame(width: 34, alignment: .leading)
             HStack(spacing: 0) {
                 if total > 0 {
                     ForEach(present, id: \.self) { f in
@@ -604,7 +708,7 @@ struct ModelShare: View {
                     }
                 }
             }
-            .frame(width: barWidth, height: 6, alignment: .leading)
+            .frame(width: barWidth, height: 4, alignment: .leading)
             .background(Color.primary.opacity(0.15))
             .clipShape(Capsule())
         }
@@ -612,20 +716,25 @@ struct ModelShare: View {
 
     private func pct(_ v: Int?, _ total: Int) -> String {
         guard total > 0 else { return "–" }
-        return "\(Int((Double(v ?? 0) / Double(total) * 100).rounded()))%"
+        return "\(Int((Double(v ?? 0) / Double(total) * 100).rounded()))"
     }
 }
 
 struct VisualEffect: NSViewRepresentable {
+    var cornerRadius: CGFloat
+
     func makeNSView(context: Context) -> NSVisualEffectView {
         let v = NSVisualEffectView()
         v.material = .hudWindow
         v.blendingMode = .behindWindow
         v.state = .active
         v.wantsLayer = true
-        v.layer?.cornerRadius = 10
+        v.layer?.cornerRadius = cornerRadius
         v.layer?.masksToBounds = true
         return v
     }
-    func updateNSView(_ v: NSVisualEffectView, context: Context) {}
+
+    func updateNSView(_ v: NSVisualEffectView, context: Context) {
+        v.layer?.cornerRadius = cornerRadius
+    }
 }
