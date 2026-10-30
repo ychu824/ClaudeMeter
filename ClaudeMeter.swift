@@ -722,8 +722,13 @@ final class LogIndex: @unchecked Sendable {
 private let contentWidth: CGFloat = 230
 private let gaugeSize: CGFloat = 44
 
+// Claude brand clay. Used for every healthy bar/ring; only a nearly-exhausted
+// limit (<= 20% left) switches to red so the warning still reads at a glance.
+let claudeAccent = hex(0xD97757)
+let warnRed = hex(0xE5484D)
+
 func leftColor(_ left: Double) -> Color {
-    left > 50 ? .green : left > 20 ? .orange : .red
+    left > 20 ? claudeAccent : warnRed
 }
 
 // Root view. The window is resized once per transition; this view morphs a single
@@ -789,6 +794,7 @@ struct ExpandedPanel: View {
                 HStack(alignment: .firstTextBaseline) {
                     Text(verbatim: store.plan ?? "Claude")
                         .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(claudeAccent)
                     Spacer(minLength: 0)
                     Text(verbatim: store.mood.caption)
                         .font(.system(size: 10))
