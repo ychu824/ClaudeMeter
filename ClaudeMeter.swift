@@ -370,6 +370,8 @@ final class Store: ObservableObject {
     private var timer: Timer?
     private var tokenTimer: Timer?
     private var busy = false
+    private var notBefore = Date.distantPast           // backoff after a 429
+    private static let cacheKey = "ClaudeMeter.lastUsage"
     private var scanning = false
     private let logIndex = LogIndex()
 
@@ -387,6 +389,12 @@ final class Store: ObservableObject {
     }
 
     func start() {
+        // Show the last good response immediately (reset times are absolute, so
+        // they stay correct); relaunching no longer means a blank widget.
+        if let data = UserDefaults.standard.data(forKey: Self.cacheKey),
+           let obj = try? JSONSerialization.jsonObject(with: data) {
+            windows = Parser.windows(from: obj)
+        }
         refresh()
         scanTokens()
         // Limits: 90s is plenty; the endpoint rate-limits aggressive polling.
@@ -400,7 +408,7 @@ final class Store: ObservableObject {
     }
 
     func refresh() {
-        guard !busy else { return }
+        guard !busy, Date() >= notBefore else { return }
         busy = true
         Task {
             await fetchLimits()
@@ -432,6 +440,7 @@ final class Store: ObservableObject {
             case 200:
                 let w = Parser.windows(from: try JSONSerialization.jsonObject(with: data))
                 windows = w
+                if !w.isEmpty { UserDefaults.standard.set(data, forKey: Self.cacheKey) }
                 if plan == nil && !profileTried {
                     profileTried = true
                     plan = await Profile.plan(token: t)
@@ -442,7 +451,11 @@ final class Store: ObservableObject {
                 token = nil   // re-read Keychain next round; Claude Code refreshes it when used
                 status = "Token expired — open Claude Code to refresh"
             case 429:
-                status = "Rate limited, will retry"
+                // Honor Retry-After (seconds), at least 2 minutes. Keep showing the
+                // cached numbers; only complain if there's nothing to show.
+                let ra = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0
+                notBefore = Date().addingTimeInterval(max(ra, 120))
+                status = windows.isEmpty ? "Rate limited, retrying in \(Int(max(ra, 120) / 60)) min" : nil
             default:
                 status = "HTTP \(code)"
             }
@@ -757,10 +770,14 @@ struct MeterView: View {
         .clipShape(shape)
         .background(
             // Shadow on the backing shape only, so text and rings don't get their own.
-            shape.fill(.regularMaterial)
-                .shadow(color: .black.opacity(0.2), radius: 5, y: 2)
+            // Claude-clay tinted glass: material for the blur, a clay wash on top.
+            ZStack {
+                shape.fill(.regularMaterial)
+                shape.fill(claudeAccent.opacity(0.18))
+            }
+            .shadow(color: claudeAccent.opacity(0.25), radius: 6, y: 2)
         )
-        .overlay(shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+        .overlay(shape.strokeBorder(claudeAccent.opacity(0.6), lineWidth: 1))
         .contentShape(shape)
         .help(store.updatedAt.map { "Updated \($0.formatted(date: .omitted, time: .standard))" } ?? "")
         .contextMenu {
