@@ -16,6 +16,7 @@
 import SwiftUI
 import AppKit
 import Combine
+import QuartzCore
 import ServiceManagement
 
 @main
@@ -55,22 +56,36 @@ final class DragHostingView<Content: View>: NSHostingView<Content> {
     }
 }
 
+// Window geometry model:
+// - `home` is the origin of the collapsed circle. It is the single source of truth
+//   for position and only changes when the user drags the widget.
+// - The expanded panel is derived from `home` + the corner of the circle nearest the
+//   screen corner, so it grows toward the screen center and collapsing returns the
+//   circle to exactly where it was (no drift).
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: NSPanel!
     private var host: DragHostingView<MeterView>!
+    private var measurer: NSHostingView<ExpandedPanel>!   // off-screen, sizes the expanded panel
     private let store = Store()
     private var bag: AnyCancellable?
     private var collapseTask: Task<Void, Never>?
+
+    private var home = NSPoint.zero
+    private var animating = false
+    private var animGen = 0
+    private static let homeKey = "ClaudeMeter.home"
+    private static let animDuration = 0.22
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon, no menu bar
 
         host = DragHostingView(rootView: MeterView(store: store))
+        host.sizingOptions = []                  // we own the window size, not SwiftUI
         host.onHover = { [weak self] inside in self?.hover(inside) }
-        let size = host.fittingSize
+        measurer = NSHostingView(rootView: ExpandedPanel(store: store))
 
-        panel = NSPanel(contentRect: NSRect(origin: .zero, size: size),
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: gaugeSize, height: gaugeSize),
                         styleMask: [.borderless, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         panel.level = .statusBar                 // above normal floating windows
@@ -83,51 +98,160 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hasShadow = true
         panel.contentView = host
 
-        if !panel.setFrameUsingName("ClaudeMeter"), let vf = NSScreen.main?.visibleFrame {
-            panel.setFrameOrigin(NSPoint(x: vf.maxX - size.width - 12, y: vf.maxY - size.height - 12))
-        }
-        panel.setFrameAutosaveName("ClaudeMeter")   // remembers where you dragged it
+        home = loadHome()
+        panel.setFrame(circleFrame, display: false)
         panel.orderFrontRegardless()
 
+        NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
+                                               object: panel, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.windowMoved() }
+        }
+
         bag = store.objectWillChange.sink { [weak self] _ in
-            Task { @MainActor in self?.fit() }
+            // objectWillChange fires before the change; hop twice so SwiftUI has applied it.
+            Task { @MainActor in
+                await Task.yield()
+                self?.relayout()
+            }
         }
         store.start()
-        fit()
     }
+
+    // MARK: Geometry
+
+    private var visibleFrame: NSRect {
+        (panel.screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+
+    private var circleFrame: NSRect {
+        NSRect(origin: home, size: NSSize(width: gaugeSize, height: gaugeSize))
+    }
+
+    // Corner of the circle that stays put while the panel grows.
+    private func pickCorner() -> Corner {
+        let c = circleFrame, vf = visibleFrame
+        let right = c.midX > vf.midX
+        let top = c.midY > vf.midY
+        switch (top, right) {
+        case (true, true):   return .topTrailing
+        case (true, false):  return .topLeading
+        case (false, true):  return .bottomTrailing
+        case (false, false): return .bottomLeading
+        }
+    }
+
+    private func expandedFrame() -> NSRect {
+        measurer.layoutSubtreeIfNeeded()
+        let size = measurer.fittingSize
+        let c = circleFrame, vf = visibleFrame
+        var r = NSRect(origin: .zero, size: size)
+        r.origin.x = store.corner.isRight ? c.maxX - size.width : c.minX
+        r.origin.y = store.corner.isTop ? c.maxY - size.height : c.minY
+        r.origin.x = min(max(r.origin.x, vf.minX), vf.maxX - size.width)
+        r.origin.y = min(max(r.origin.y, vf.minY), vf.maxY - size.height)
+        return r
+    }
+
+    private func loadHome() -> NSPoint {
+        let vf = visibleFrame
+        var p = NSPoint(x: vf.maxX - gaugeSize - 12, y: vf.maxY - gaugeSize - 12)
+        if let s = UserDefaults.standard.string(forKey: Self.homeKey) {
+            let q = NSPointFromString(s)
+            if q != .zero { p = q }
+        }
+        p.x = min(max(p.x, vf.minX), vf.maxX - gaugeSize)
+        p.y = min(max(p.y, vf.minY), vf.maxY - gaugeSize)
+        return p
+    }
+
+    // A move we didn't animate = the user dragged it. Re-derive `home` from the
+    // current frame and the anchored corner, then persist.
+    private func windowMoved() {
+        guard !animating else { return }
+        let f = panel.frame
+        if store.expanded {
+            home.x = store.corner.isRight ? f.maxX - gaugeSize : f.minX
+            home.y = store.corner.isTop ? f.maxY - gaugeSize : f.minY
+        } else {
+            home = f.origin
+        }
+        UserDefaults.standard.set(NSStringFromPoint(home), forKey: Self.homeKey)
+    }
+
+    // MARK: Expand / collapse
 
     // Expand immediately on hover; collapse after a short grace period so the
     // widget doesn't flicker when the pointer brushes the edge.
     private func hover(_ inside: Bool) {
         collapseTask?.cancel()
         if inside {
-            if !store.expanded { store.expanded = true }
+            if !store.expanded { expand() }
         } else {
             collapseTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 350_000_000)
                 guard !Task.isCancelled else { return }
-                self?.store.expanded = false
+                self?.collapse()
             }
         }
     }
 
-    // Resize to content, keeping the corner nearest the screen corner fixed,
-    // so the panel always grows toward the middle of the screen.
-    private func fit() {
-        host.layoutSubtreeIfNeeded()
-        let size = host.fittingSize
-        let f = panel.frame
-        guard f.size != size else { return }
-        let vf = (panel.screen ?? NSScreen.main)?.visibleFrame ?? f
-        let anchorRight = f.midX > vf.midX
-        let anchorTop = f.midY > vf.midY
-        var n = NSRect(origin: .zero, size: size)
-        n.origin.x = anchorRight ? f.maxX - size.width : f.minX
-        n.origin.y = anchorTop ? f.maxY - size.height : f.minY
-        n.origin.x = min(max(n.origin.x, vf.minX), vf.maxX - size.width)
-        n.origin.y = min(max(n.origin.y, vf.minY), vf.maxY - size.height)
-        panel.setFrame(n, display: true)
+    private func expand() {
+        store.corner = pickCorner()
+        let target = expandedFrame()
+        withAnimation(.easeOut(duration: Self.animDuration)) { store.expanded = true }
+        animate(to: target)
+    }
+
+    private func collapse() {
+        guard store.expanded else { return }
+        withAnimation(.easeIn(duration: Self.animDuration * 0.8)) { store.expanded = false }
+        animate(to: circleFrame)
+    }
+
+    private func animate(to target: NSRect) {
+        animGen += 1
+        let gen = animGen
+        animating = true
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = Self.animDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            panel.animator().setFrame(target, display: true)
+        }, completionHandler: { [weak self] in
+            Task { @MainActor in
+                guard let self, self.animGen == gen else { return }
+                self.animating = false
+                self.panel.invalidateShadow()
+                self.relayout()
+            }
+        })
+    }
+
+    // Keeps the window matched to its state when content changes (e.g. a new limit
+    // row appears while expanded). Never runs mid-animation.
+    private func relayout() {
+        guard !animating else { return }
+        let target = store.expanded ? expandedFrame() : circleFrame
+        guard panel.frame != target else { return }
+        animating = true          // suppress windowMoved for this programmatic move
+        panel.setFrame(target, display: true)
+        animating = false
         panel.invalidateShadow()
+    }
+}
+
+enum Corner {
+    case topLeading, topTrailing, bottomLeading, bottomTrailing
+
+    var isTop: Bool { self == .topLeading || self == .topTrailing }
+    var isRight: Bool { self == .topTrailing || self == .bottomTrailing }
+
+    var alignment: Alignment {
+        switch self {
+        case .topLeading:     return .topLeading
+        case .topTrailing:    return .topTrailing
+        case .bottomLeading:  return .bottomLeading
+        case .bottomTrailing: return .bottomTrailing
+        }
     }
 }
 
@@ -211,6 +335,7 @@ final class Store: ObservableObject {
     @Published var updatedAt: Date?
     @Published var plan: String?
     @Published var expanded = false
+    @Published var corner: Corner = .topTrailing
 
     private var token: String?
     private var profileTried = false
@@ -515,59 +640,35 @@ func leftColor(_ left: Double) -> Color {
     left > 50 ? .green : left > 20 ? .orange : .red
 }
 
+// Root view. The window frame is animated by AppKit; this view fills it, pins its
+// content to the anchored corner, and cross-fades gauge <-> panel. The background's
+// corner radius animates from circle to rounded rect in step with the frame.
 struct MeterView: View {
     @ObservedObject var store: Store
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { ctx in
-            Group {
-                if store.expanded {
-                    expanded(now: ctx.date)
-                } else {
-                    Gauge(fiveHour: store.windows.first { $0.id == "five_hour" },
-                          sevenDay: store.windows.first { $0.id == "seven_day" },
-                          failed: store.windows.isEmpty && store.status != nil)
-                }
-            }
-            .contextMenu {
-                Button("Refresh") { store.refresh() }
-                Button(SMAppService.mainApp.status == .enabled ? "✓ Launch at Login" : "Launch at Login") { toggleLogin() }
-                Divider()
-                Button("Quit") { NSApp.terminate(nil) }
+        ZStack(alignment: store.corner.alignment) {
+            if store.expanded {
+                ExpandedPanel(store: store)
+                    .transition(.opacity)
+            } else {
+                Gauge(fiveHour: store.windows.first { $0.id == "five_hour" },
+                      sevenDay: store.windows.first { $0.id == "seven_day" },
+                      failed: store.windows.isEmpty && store.status != nil)
+                    .transition(.opacity)
             }
         }
-    }
-
-    private func expanded(now: Date) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(verbatim: store.plan ?? "Claude")
-                    .font(.system(size: 12, weight: .semibold))
-                Spacer(minLength: 0)
-                Text(verbatim: store.mood.caption)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(store.windows) { WindowRow(w: $0, now: now) }
-            if store.stats.totalDay > 0 {
-                Divider().opacity(0.4)
-                ModelShare(s: store.stats)
-            }
-            if let s = store.status {
-                Text(verbatim: s)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Text(verbatim: "tok  5h \(fmt(store.stats.total5h)) · today \(fmt(store.stats.totalDay))")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .frame(width: contentWidth + 20, alignment: .leading)
-        .background(VisualEffect(cornerRadius: 10))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: store.corner.alignment)
+        .clipped()
+        .background(VisualEffect(cornerRadius: store.expanded ? 10 : gaugeSize / 2))
+        .contentShape(Rectangle())
         .help(store.updatedAt.map { "Updated \($0.formatted(date: .omitted, time: .standard))" } ?? "")
+        .contextMenu {
+            Button("Refresh") { store.refresh() }
+            Button(SMAppService.mainApp.status == .enabled ? "✓ Launch at Login" : "Launch at Login") { toggleLogin() }
+            Divider()
+            Button("Quit") { NSApp.terminate(nil) }
+        }
     }
 
     private func toggleLogin() {
@@ -576,6 +677,45 @@ struct MeterView: View {
             if s.status == .enabled { try s.unregister() } else { try s.register() }
         } catch {
             NSSound.beep()
+        }
+    }
+}
+
+// Expanded content at its natural size (no background). Also used off-screen to
+// measure the expanded window size.
+struct ExpandedPanel: View {
+    @ObservedObject var store: Store
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { ctx in
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(verbatim: store.plan ?? "Claude")
+                        .font(.system(size: 12, weight: .semibold))
+                    Spacer(minLength: 0)
+                    Text(verbatim: store.mood.caption)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(store.windows) { WindowRow(w: $0, now: ctx.date) }
+                if store.stats.totalDay > 0 {
+                    Divider().opacity(0.4)
+                    ModelShare(s: store.stats)
+                }
+                if let s = store.status {
+                    Text(verbatim: s)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(verbatim: "tok  5h \(fmt(store.stats.total5h)) · today \(fmt(store.stats.totalDay))")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(width: contentWidth + 20, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -597,7 +737,6 @@ struct Gauge: View {
                 .foregroundStyle(failed ? Color.secondary : Color.primary)
         }
         .frame(width: gaugeSize, height: gaugeSize)
-        .background(VisualEffect(cornerRadius: gaugeSize / 2))
     }
 
     private var center: String {
@@ -730,11 +869,20 @@ struct VisualEffect: NSViewRepresentable {
         v.state = .active
         v.wantsLayer = true
         v.layer?.cornerRadius = cornerRadius
+        v.layer?.cornerCurve = .continuous
         v.layer?.masksToBounds = true
         return v
     }
 
+    // Animate the radius change so circle -> rounded rect morphs with the frame.
     func updateNSView(_ v: NSVisualEffectView, context: Context) {
-        v.layer?.cornerRadius = cornerRadius
+        guard let layer = v.layer, layer.cornerRadius != cornerRadius else { return }
+        let anim = CABasicAnimation(keyPath: "cornerRadius")
+        anim.fromValue = layer.cornerRadius
+        anim.toValue = cornerRadius
+        anim.duration = 0.22
+        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.cornerRadius = cornerRadius
+        layer.add(anim, forKey: "cornerRadius")
     }
 }
