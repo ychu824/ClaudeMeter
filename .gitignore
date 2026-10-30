@@ -1,0 +1,7 @@
+# Build output
+ClaudeMeter.app/
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
