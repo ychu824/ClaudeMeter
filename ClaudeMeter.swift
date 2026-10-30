@@ -27,8 +27,11 @@ struct ClaudeMeterApp: App {
 
 // MARK: - Window
 
+private let windowMargin: CGFloat = 10   // transparent room around the shape for its shadow
+
 // Hosting view that (a) lets you drag the window from anywhere and (b) reports
 // hover even though the panel never becomes key (.activeAlways tracking).
+// The hover rect excludes the transparent shadow margin.
 final class DragHostingView<Content: View>: NSHostingView<Content> {
     var onHover: (@MainActor (Bool) -> Void)?
     private var area: NSTrackingArea?
@@ -38,8 +41,8 @@ final class DragHostingView<Content: View>: NSHostingView<Content> {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let a = area { removeTrackingArea(a) }
-        let a = NSTrackingArea(rect: .zero,
-                               options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+        let a = NSTrackingArea(rect: bounds.insetBy(dx: windowMargin, dy: windowMargin),
+                               options: [.mouseEnteredAndExited, .activeAlways],
                                owner: self, userInfo: nil)
         addTrackingArea(a)
         area = a
@@ -57,11 +60,18 @@ final class DragHostingView<Content: View>: NSHostingView<Content> {
 }
 
 // Window geometry model:
-// - `home` is the origin of the collapsed circle. It is the single source of truth
-//   for position and only changes when the user drags the widget.
-// - The expanded panel is derived from `home` + the corner of the circle nearest the
-//   screen corner, so it grows toward the screen center and collapsing returns the
-//   circle to exactly where it was (no drift).
+// - `home` is the origin of the collapsed circle (content rect, without margin). It is
+//   the single source of truth for position and only changes when the user drags.
+// - The expanded panel is anchored at the circle's corner nearest the screen corner,
+//   so it grows toward the screen center and collapsing returns to exactly `home`.
+//
+// Animation: resizing an NSWindow every frame (and re-rendering its blur + shadow)
+// is what made the previous version stutter. Now the window is resized exactly once
+// per transition, and the morph itself is a SwiftUI animation of a shape inside the
+// window, which Core Animation composites on the GPU at display refresh rate.
+//   expand:   grow window to panel size instantly (circle stays pinned in its
+//             corner, so nothing visibly moves) -> animate shape circle -> panel
+//   collapse: animate shape panel -> circle -> shrink window to circle size
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: NSPanel!
@@ -72,10 +82,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var collapseTask: Task<Void, Never>?
 
     private var home = NSPoint.zero
-    private var animating = false
-    private var animGen = 0
+    private var windowIsExpanded = false
+    private var programmaticMove = false
+    private var gen = 0
     private static let homeKey = "ClaudeMeter.home"
-    private static let animDuration = 0.22
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon, no menu bar
@@ -95,20 +105,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = true
         panel.backgroundColor = .clear
         panel.isOpaque = false
-        panel.hasShadow = true
+        panel.hasShadow = false                  // SwiftUI draws the shadow so it animates with the shape
         panel.contentView = host
 
         home = loadHome()
-        panel.setFrame(circleFrame, display: false)
+        setWindow(content: circleRect)
         panel.orderFrontRegardless()
 
+        // queue: nil -> delivered synchronously during setFrame, so programmaticMove is accurate.
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
-                                               object: panel, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.windowMoved() }
+                                               object: panel, queue: nil) { [weak self] _ in
+            MainActor.assumeIsolated { self?.windowMoved() }
         }
 
         bag = store.objectWillChange.sink { [weak self] _ in
-            // objectWillChange fires before the change; hop twice so SwiftUI has applied it.
+            // objectWillChange fires before the change; yield so SwiftUI has applied it.
             Task { @MainActor in
                 await Task.yield()
                 self?.relayout()
@@ -123,16 +134,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         (panel.screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
     }
 
-    private var circleFrame: NSRect {
+    private var circleRect: NSRect {
         NSRect(origin: home, size: NSSize(width: gaugeSize, height: gaugeSize))
     }
 
     // Corner of the circle that stays put while the panel grows.
     private func pickCorner() -> Corner {
-        let c = circleFrame, vf = visibleFrame
-        let right = c.midX > vf.midX
-        let top = c.midY > vf.midY
-        switch (top, right) {
+        let c = circleRect, vf = visibleFrame
+        switch (c.midY > vf.midY, c.midX > vf.midX) {
         case (true, true):   return .topTrailing
         case (true, false):  return .topLeading
         case (false, true):  return .bottomTrailing
@@ -140,16 +149,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func expandedFrame() -> NSRect {
+    private func measuredPanelSize() -> CGSize {
         measurer.layoutSubtreeIfNeeded()
-        let size = measurer.fittingSize
-        let c = circleFrame, vf = visibleFrame
+        return measurer.fittingSize
+    }
+
+    private func panelRect(_ size: CGSize) -> NSRect {
+        let c = circleRect, vf = visibleFrame
         var r = NSRect(origin: .zero, size: size)
         r.origin.x = store.corner.isRight ? c.maxX - size.width : c.minX
         r.origin.y = store.corner.isTop ? c.maxY - size.height : c.minY
         r.origin.x = min(max(r.origin.x, vf.minX), vf.maxX - size.width)
         r.origin.y = min(max(r.origin.y, vf.minY), vf.maxY - size.height)
         return r
+    }
+
+    private var contentRect: NSRect {
+        panel.frame.insetBy(dx: windowMargin, dy: windowMargin)
+    }
+
+    private func setWindow(content r: NSRect) {
+        let f = r.insetBy(dx: -windowMargin, dy: -windowMargin)
+        guard panel.frame != f else { return }
+        programmaticMove = true
+        panel.setFrame(f, display: true)
+        programmaticMove = false
     }
 
     private func loadHome() -> NSPoint {
@@ -164,16 +188,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return p
     }
 
-    // A move we didn't animate = the user dragged it. Re-derive `home` from the
-    // current frame and the anchored corner, then persist.
+    // Only user drags get here. Re-derive `home` from the anchored corner and persist.
     private func windowMoved() {
-        guard !animating else { return }
-        let f = panel.frame
-        if store.expanded {
-            home.x = store.corner.isRight ? f.maxX - gaugeSize : f.minX
-            home.y = store.corner.isTop ? f.maxY - gaugeSize : f.minY
+        guard !programmaticMove else { return }
+        let r = contentRect
+        if windowIsExpanded {
+            home.x = store.corner.isRight ? r.maxX - gaugeSize : r.minX
+            home.y = store.corner.isTop ? r.maxY - gaugeSize : r.minY
         } else {
-            home = f.origin
+            home = r.origin
         }
         UserDefaults.standard.set(NSStringFromPoint(home), forKey: Self.homeKey)
     }
@@ -185,10 +208,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hover(_ inside: Bool) {
         collapseTask?.cancel()
         if inside {
-            if !store.expanded { expand() }
+            if !store.open { expand() }
         } else {
             collapseTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 350_000_000)
+                try? await Task.sleep(nanoseconds: 300_000_000)
                 guard !Task.isCancelled else { return }
                 self?.collapse()
             }
@@ -196,48 +219,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func expand() {
-        store.corner = pickCorner()
-        let target = expandedFrame()
-        withAnimation(.easeOut(duration: Self.animDuration)) { store.expanded = true }
-        animate(to: target)
+        gen += 1
+        if !windowIsExpanded {
+            store.corner = pickCorner()
+            store.panelSize = measuredPanelSize()
+            setWindow(content: panelRect(store.panelSize))
+            windowIsExpanded = true
+        }
+        store.scanTokens()   // freshest model mix the moment you look
+        // Let SwiftUI lay out once at the new window size (circle still pinned in its
+        // corner), then morph.
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            withAnimation(morph) { self?.store.open = true }
+        }
     }
 
     private func collapse() {
-        guard store.expanded else { return }
-        withAnimation(.easeIn(duration: Self.animDuration * 0.8)) { store.expanded = false }
-        animate(to: circleFrame)
+        guard store.open else { return }
+        gen += 1
+        let g = gen
+        withAnimation(morph) { store.open = false }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 420_000_000)   // let the spring settle
+            guard let self, self.gen == g, !self.store.open else { return }
+            self.setWindow(content: self.circleRect)
+            self.windowIsExpanded = false
+        }
     }
 
-    private func animate(to target: NSRect) {
-        animGen += 1
-        let gen = animGen
-        animating = true
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = Self.animDuration
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            panel.animator().setFrame(target, display: true)
-        }, completionHandler: { [weak self] in
-            Task { @MainActor in
-                guard let self, self.animGen == gen else { return }
-                self.animating = false
-                self.panel.invalidateShadow()
-                self.relayout()
-            }
-        })
-    }
-
-    // Keeps the window matched to its state when content changes (e.g. a new limit
-    // row appears while expanded). Never runs mid-animation.
+    // Keeps the window matched to content changes (e.g. a new limit row appears while
+    // open). Skips mid-transition.
     private func relayout() {
-        guard !animating else { return }
-        let target = store.expanded ? expandedFrame() : circleFrame
-        guard panel.frame != target else { return }
-        animating = true          // suppress windowMoved for this programmatic move
-        panel.setFrame(target, display: true)
-        animating = false
-        panel.invalidateShadow()
+        guard store.open == windowIsExpanded else { return }
+        if windowIsExpanded {
+            let size = measuredPanelSize()
+            if size != store.panelSize {
+                store.panelSize = size
+                setWindow(content: panelRect(size))
+            }
+        } else {
+            setWindow(content: circleRect)
+        }
     }
 }
+
+let morph = Animation.spring(response: 0.34, dampingFraction: 0.86)
 
 enum Corner {
     case topLeading, topTrailing, bottomLeading, bottomTrailing
@@ -273,7 +300,7 @@ struct UsageWindow: Identifiable {
     }
 }
 
-struct TokenStats {
+struct TokenStats: Equatable {
     var total5h = 0
     var totalDay = 0
     var by5h: [String: Int] = [:]
@@ -334,13 +361,17 @@ final class Store: ObservableObject {
     @Published var status: String?
     @Published var updatedAt: Date?
     @Published var plan: String?
-    @Published var expanded = false
+    @Published var open = false                       // visual state (drives the morph)
     @Published var corner: Corner = .topTrailing
+    @Published var panelSize = CGSize(width: 250, height: 150)
 
     private var token: String?
     private var profileTried = false
     private var timer: Timer?
+    private var tokenTimer: Timer?
     private var busy = false
+    private var scanning = false
+    private let logIndex = LogIndex()
 
     // Driven by the tightest limit (lowest % left across all windows).
     var mood: Mood {
@@ -357,9 +388,14 @@ final class Store: ObservableObject {
 
     func start() {
         refresh()
-        // 90s is plenty; the endpoint rate-limits aggressive polling.
+        scanTokens()
+        // Limits: 90s is plenty; the endpoint rate-limits aggressive polling.
         timer = Timer.scheduledTimer(withTimeInterval: 90, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
+        }
+        // Local logs: cheap incremental tail, so poll often.
+        tokenTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.scanTokens() }
         }
     }
 
@@ -368,8 +404,8 @@ final class Store: ObservableObject {
         busy = true
         Task {
             await fetchLimits()
-            await scanTokens()
             busy = false
+            scanTokens()   // the 5h window start may have moved
         }
     }
 
@@ -415,7 +451,11 @@ final class Store: ObservableObject {
         }
     }
 
-    private func scanTokens() async {
+    // Independent of the network fetch. Reads only bytes appended to the logs since
+    // the last scan, so a pass is milliseconds even with hundreds of MB of history.
+    func scanTokens() {
+        guard !scanning else { return }
+        scanning = true
         let now = Date()
         var start5h = now.addingTimeInterval(-5 * 3600)
         if let r = windows.first(where: { $0.id == "five_hour" })?.resetsAt, r > now {
@@ -423,9 +463,15 @@ final class Store: ObservableObject {
         }
         let startDay = Calendar.current.startOfDay(for: now)
         let s5 = start5h
-        stats = await Task.detached(priority: .utility) {
-            LocalLogs.sum(since5h: s5, sinceDay: startDay)
-        }.value
+        let idx = logIndex
+        Task {
+            let s = await Task.detached(priority: .utility) { () -> TokenStats in
+                idx.update(cutoff: min(s5, startDay))
+                return idx.sum(since5h: s5, sinceDay: startDay)
+            }.value
+            if s != stats { stats = s }
+            scanning = false
+        }
     }
 }
 
@@ -576,7 +622,23 @@ enum Parser {
 
 // MARK: - Local Claude Code logs
 
-enum LocalLogs {
+// Incremental index over Claude Code's session logs (~/.claude/projects/**/*.jsonl).
+// Remembers a byte offset per file and parses only newly appended complete lines.
+// Not thread-safe: Store calls it from one detached task at a time (`scanning` guard).
+final class LogIndex: @unchecked Sendable {
+    private struct Entry {
+        let t: Date
+        let fam: String
+        let n: Int
+        let key: String
+    }
+
+    private var offsets: [String: UInt64] = [:]
+    private var entries: [Entry] = []
+    private var seen = Set<String>()
+    private var lastCutoff = Date.distantPast
+    private static let usageMarker = Data("\"usage\"".utf8)
+
     private static func roots() -> [URL] {
         let home = FileManager.default.homeDirectoryForCurrentUser
         var r = [home.appendingPathComponent(".claude/projects"),
@@ -587,44 +649,68 @@ enum LocalLogs {
         return r
     }
 
+    func update(cutoff: Date) {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
+        for root in Self.roots() {
+            guard let en = fm.enumerator(at: root, includingPropertiesForKeys: keys) else { continue }
+            for case let url as URL in en where url.pathExtension == "jsonl" {
+                let rv = try? url.resourceValues(forKeys: Set(keys))
+                let mod = rv?.contentModificationDate ?? .distantPast
+                let size = UInt64(rv?.fileSize ?? 0)
+                let path = url.path
+                // Never-read files untouched since the cutoff hold nothing we need.
+                if offsets[path] == nil && mod < cutoff { continue }
+                var off = offsets[path] ?? 0
+                if size < off { off = 0 }                  // truncated or rewritten
+                guard size > off, let fh = try? FileHandle(forReadingFrom: url) else { continue }
+                defer { try? fh.close() }
+                guard (try? fh.seek(toOffset: off)) != nil,
+                      let data = try? fh.readToEnd(),
+                      let lastNL = data.lastIndex(of: 0x0A) else { continue }
+                // Only consume complete lines; a half-written last line is read next time.
+                let complete = data[data.startIndex...lastNL]
+                for line in complete.split(separator: 0x0A) {
+                    ingest(Data(line), cutoff: cutoff)
+                }
+                offsets[path] = off + UInt64(complete.count)
+            }
+        }
+        if cutoff > lastCutoff {
+            entries.removeAll { $0.t < cutoff }
+            seen = Set(entries.map(\.key))
+            lastCutoff = cutoff
+        }
+    }
+
     // Counts input + output + cache-write tokens. Cache reads are excluded:
     // they dwarf everything else and don't reflect real work.
-    static func sum(since5h: Date, sinceDay: Date) -> TokenStats {
-        let cutoff = min(since5h, sinceDay)
-        let fm = FileManager.default
-        var seen = Set<String>()
+    private func ingest(_ d: Data, cutoff: Date) {
+        guard d.range(of: Self.usageMarker) != nil,
+              let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+              let msg = o["message"] as? [String: Any],
+              let u = msg["usage"] as? [String: Any],
+              let ts = o["timestamp"] as? String,
+              let t = Parser.iso(ts), t >= cutoff else { return }
+        // Streaming writes the same message several times; dedupe.
+        let key = "\(msg["id"] as? String ?? "")|\(o["requestId"] as? String ?? UUID().uuidString)"
+        guard seen.insert(key).inserted else { return }
+        let n = ["input_tokens", "output_tokens", "cache_creation_input_tokens"]
+            .reduce(0) { $0 + ((u[$1] as? NSNumber)?.intValue ?? 0) }
+        guard n > 0 else { return }
+        entries.append(Entry(t: t, fam: Family.of(msg["model"] as? String), n: n, key: key))
+    }
+
+    func sum(since5h: Date, sinceDay: Date) -> TokenStats {
         var s = TokenStats()
-
-        for root in roots() {
-            guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
-            for case let url as URL in en where url.pathExtension == "jsonl" {
-                let mod = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                guard mod >= cutoff, let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-
-                text.enumerateLines { line, _ in
-                    guard line.contains("\"usage\""),
-                          let d = line.data(using: .utf8),
-                          let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-                          let msg = o["message"] as? [String: Any],
-                          let u = msg["usage"] as? [String: Any],
-                          let ts = o["timestamp"] as? String,
-                          let t = Parser.iso(ts), t >= cutoff else { return }
-                    // Streaming writes the same message several times; dedupe.
-                    let key = "\(msg["id"] as? String ?? "")|\(o["requestId"] as? String ?? UUID().uuidString)"
-                    guard seen.insert(key).inserted else { return }
-                    let n = ["input_tokens", "output_tokens", "cache_creation_input_tokens"]
-                        .reduce(0) { $0 + ((u[$1] as? NSNumber)?.intValue ?? 0) }
-                    guard n > 0 else { return }
-                    let fam = Family.of(msg["model"] as? String)
-                    if t >= since5h {
-                        s.total5h += n
-                        s.by5h[fam, default: 0] += n
-                    }
-                    if t >= sinceDay {
-                        s.totalDay += n
-                        s.byDay[fam, default: 0] += n
-                    }
-                }
+        for e in entries {
+            if e.t >= since5h {
+                s.total5h += e.n
+                s.by5h[e.fam, default: 0] += e.n
+            }
+            if e.t >= sinceDay {
+                s.totalDay += e.n
+                s.byDay[e.fam, default: 0] += e.n
             }
         }
         return s
@@ -640,15 +726,19 @@ func leftColor(_ left: Double) -> Color {
     left > 50 ? .green : left > 20 ? .orange : .red
 }
 
-// Root view. The window frame is animated by AppKit; this view fills it, pins its
-// content to the anchored corner, and cross-fades gauge <-> panel. The background's
-// corner radius animates from circle to rounded rect in step with the frame.
+// Root view. The window is resized once per transition; this view morphs a single
+// shape between the 44pt circle and the panel size, pinned to the anchored corner,
+// while the gauge and panel cross-fade. Shadow is drawn here so it tracks the shape.
 struct MeterView: View {
     @ObservedObject var store: Store
 
     var body: some View {
+        let w = store.open ? store.panelSize.width : gaugeSize
+        let h = store.open ? store.panelSize.height : gaugeSize
+        let shape = RoundedRectangle(cornerRadius: store.open ? 10 : gaugeSize / 2, style: .continuous)
+
         ZStack(alignment: store.corner.alignment) {
-            if store.expanded {
+            if store.open {
                 ExpandedPanel(store: store)
                     .transition(.opacity)
             } else {
@@ -658,10 +748,15 @@ struct MeterView: View {
                     .transition(.opacity)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: store.corner.alignment)
-        .clipped()
-        .background(VisualEffect(cornerRadius: store.expanded ? 10 : gaugeSize / 2))
-        .contentShape(Rectangle())
+        .frame(width: w, height: h, alignment: store.corner.alignment)
+        .clipShape(shape)
+        .background(
+            // Shadow on the backing shape only, so text and rings don't get their own.
+            shape.fill(.regularMaterial)
+                .shadow(color: .black.opacity(0.2), radius: 5, y: 2)
+        )
+        .overlay(shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+        .contentShape(shape)
         .help(store.updatedAt.map { "Updated \($0.formatted(date: .omitted, time: .standard))" } ?? "")
         .contextMenu {
             Button("Refresh") { store.refresh() }
@@ -669,6 +764,8 @@ struct MeterView: View {
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: store.corner.alignment)
+        .padding(windowMargin)
     }
 
     private func toggleLogin() {
@@ -856,33 +953,5 @@ struct ModelShare: View {
     private func pct(_ v: Int?, _ total: Int) -> String {
         guard total > 0 else { return "–" }
         return "\(Int((Double(v ?? 0) / Double(total) * 100).rounded()))"
-    }
-}
-
-struct VisualEffect: NSViewRepresentable {
-    var cornerRadius: CGFloat
-
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let v = NSVisualEffectView()
-        v.material = .hudWindow
-        v.blendingMode = .behindWindow
-        v.state = .active
-        v.wantsLayer = true
-        v.layer?.cornerRadius = cornerRadius
-        v.layer?.cornerCurve = .continuous
-        v.layer?.masksToBounds = true
-        return v
-    }
-
-    // Animate the radius change so circle -> rounded rect morphs with the frame.
-    func updateNSView(_ v: NSVisualEffectView, context: Context) {
-        guard let layer = v.layer, layer.cornerRadius != cornerRadius else { return }
-        let anim = CABasicAnimation(keyPath: "cornerRadius")
-        anim.fromValue = layer.cornerRadius
-        anim.toValue = cornerRadius
-        anim.duration = 0.22
-        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        layer.cornerRadius = cornerRadius
-        layer.add(anim, forKey: "cornerRadius")
     }
 }
