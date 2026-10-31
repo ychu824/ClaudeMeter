@@ -28,11 +28,15 @@ The App Sandbox would block both data sources: reading another app's Keychain it
 ## Verify it yourself
 
 - **Read the code.** The whole app is one file, `TokenTide.swift`. Run `grep -n "Net.get\|SecItem\|UserDefaults" TokenTide.swift` to find every network call, Keychain read and write in a few seconds.
-- **Check a downloaded build.** Confirm a release was built by this repository's GitHub Actions from the tagged source:
+- **Check a downloaded build.** Confirm the checksum, signature and notarization:
 
   ```bash
-  gh attestation verify TokenTide-vX.Y.Z.zip --repo ychu824/TokenTide
+  shasum -a 256 -c SHA256SUMS.txt
+  codesign -dv --verbose=4 TokenTide.app                    # Developer ID Application: Yucheng Hu (H63486AZ9Y)
+  spctl --assess --type execute --verbose=2 TokenTide.app   # source=Notarized Developer ID
   ```
+
+  Or build it yourself from the tagged source with `./build.sh`.
 
 - **Watch the traffic.** Run Little Snitch or LuLu, and you should only ever see `api.anthropic.com`.
 

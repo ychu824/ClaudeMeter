@@ -38,11 +38,7 @@ TokenTide reads the OAuth token Claude Code keeps in your Keychain, so it's buil
 - **Reads the token the same way Claude Code does,** so there are no extra prompts, and it adds no new access path.
 - **Stores almost nothing:** the widget position and the last limit percentages and reset times. It never stores the raw API response.
 - **One file to audit.** The entire app is `TokenTide.swift`.
-- **Signed and notarized.** Every release is signed with a Developer ID and notarized by Apple. Releases built by GitHub Actions also carry a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations) (v0.1.0 was built locally, so attestations start with the next release):
-
-  ```bash
-  gh attestation verify TokenTide-vX.Y.Z.zip --repo ychu824/TokenTide
-  ```
+- **Signed and notarized.** Every release is signed with a Developer ID and notarized by Apple, and ships with a `SHA256SUMS.txt`.
 
 Details and threat model: [SECURITY.md](SECURITY.md).
 

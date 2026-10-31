@@ -27,7 +27,7 @@ ZIP="TokenTide-$TAG.zip"
 
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || { echo "Working tree has uncommitted changes."; exit 1; }
 
-# Tag: reuse it if it exists (e.g. a CI run failed), otherwise create and push it.
+# Tag: reuse it if it exists, otherwise create and push it.
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   echo "Using existing tag $TAG"
 else
