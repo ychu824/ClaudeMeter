@@ -14,7 +14,7 @@ A tiny always-on-top macOS widget that shows how much of your Claude plan is lef
 
 ## Install
 
-**Download (recommended):** grab `TokenTide-vX.Y.Z.zip` from [Releases](https://github.com/ychu824/TokenTide/releases), unzip it, and move `TokenTide.app` to `/Applications`. It's signed with a Developer ID and notarized by Apple, so it opens with a double-click.
+**Download (recommended):** grab [`TokenTide-v0.1.0.zip`](https://github.com/ychu824/TokenTide/releases/latest) from Releases, unzip it, and move `TokenTide.app` to `/Applications`. It's signed with a Developer ID and notarized by Apple, so it opens with a double-click.
 
 **Or build from source:** needs Xcode Command Line Tools (`xcode-select --install`).
 
@@ -36,7 +36,7 @@ TokenTide reads the OAuth token Claude Code keeps in your Keychain, so it's buil
 - **Reads the token the same way Claude Code does,** so there are no extra prompts, and it adds no new access path.
 - **Stores almost nothing:** the widget position and the last limit percentages and reset times. It never stores the raw API response.
 - **One file to audit.** The entire app is `TokenTide.swift`.
-- **Verifiable builds.** Releases are built, signed and notarized by GitHub Actions from the tagged source, with a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
+- **Signed and notarized.** Every release is signed with a Developer ID and notarized by Apple. Releases built by GitHub Actions also carry a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations) (v0.1.0 was built locally, so attestations start with the next release):
 
   ```bash
   gh attestation verify TokenTide-vX.Y.Z.zip --repo ychu824/TokenTide
