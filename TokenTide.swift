@@ -384,6 +384,8 @@ final class Store: ObservableObject {
     private var tokenTimer: Timer?
     private var busy = false
     private var notBefore = Date.distantPast           // backoff after a 429
+    private var firstLoad = true                       // the launch read may prompt once
+    @Published var needsKeychainApproval = false
     private static let cacheKey = "TokenTide.limits"   // minimal: [{id, pct, resetsAt}]
     private var scanning = false
     private let logIndex = LogIndex()
@@ -420,27 +422,39 @@ final class Store: ObservableObject {
         }
     }
 
-    func refresh() {
-        guard !busy, Date() >= notBefore else { return }
+    // interactive = the user asked (Refresh in the menu). Only then may a Keychain
+    // permission dialog appear; timer-driven refreshes never prompt.
+    func refresh(interactive: Bool = false) {
+        guard !busy, interactive || Date() >= notBefore else { return }
         busy = true
         Task {
-            await fetchLimits()
+            await fetchLimits(interactive: interactive)
             busy = false
             scanTokens()   // the 5h window start may have moved
         }
     }
 
-    private func fetchLimits() async {
+    private func fetchLimits(interactive: Bool) async {
         if token == nil {
-            // Off the main thread: the first Keychain read may show an "Allow" dialog.
-            let c = await Task.detached(priority: .utility) { Credentials.read() }.value
-            token = c?.token
-            if let p = c?.plan { plan = p }
+            // Read once and keep it in memory; re-read only after a 401.
+            let allowPrompt = interactive || firstLoad
+            firstLoad = false
+            let r = await Task.detached(priority: .utility) { Credentials.read(interactive: allowPrompt) }.value
+            switch r {
+            case .ok(let c):
+                token = c.token
+                if let p = c.plan { plan = p }
+                needsKeychainApproval = false
+            case .needsApproval:
+                needsKeychainApproval = true
+                status = "Keychain access needed — right-click → Refresh"
+                return
+            case .missing:
+                status = "No Claude Code login — run `claude` once"
+                return
+            }
         }
-        guard let t = token else {
-            status = "No Claude Code login — run `claude` once"
-            return
-        }
+        guard let t = token else { return }
         do {
             let (data, resp) = try await Net.get("/api/oauth/usage", token: t)
             let code = resp.statusCode
@@ -506,13 +520,26 @@ struct Creds {
     let plan: String?
 }
 
+enum KeychainRead {
+    case ok(Creds)
+    case needsApproval   // item exists, but reading it would show the macOS "allow" dialog
+    case missing
+}
+
 enum Credentials {
-    static func read() -> Creds? {
-        if let s = keychain(), let c = parse(s) { return c }
+    // interactive: false never shows a Keychain dialog. Background refreshes use
+    // this, so the widget can't pop up permission prompts on its own; it shows a
+    // status line instead and only prompts when you choose Refresh.
+    static func read(interactive: Bool) -> KeychainRead {
+        let (str, st) = keychain(interactive: interactive)
+        if let s = str, let c = parse(s) { return .ok(c) }
+        if st == errSecInteractionNotAllowed || st == errSecAuthFailed || st == errSecUserCanceled {
+            return .needsApproval
+        }
         // Linux-style fallback some setups use.
         let f = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/.credentials.json")
-        if let s = try? String(contentsOf: f, encoding: .utf8), let c = parse(s) { return c }
-        return nil
+        if let s = try? String(contentsOf: f, encoding: .utf8), let c = parse(s) { return .ok(c) }
+        return .missing
     }
 
     // "max" + "default_claude_max_20x" -> "Max 20x"; "pro" -> "Pro"; etc.
@@ -533,17 +560,24 @@ enum Credentials {
     // Security framework, not /usr/bin/security: the user's "Always Allow" then
     // applies to TokenTide's code signature only. Granting it to the `security`
     // CLI would let any process on the machine read the token without a prompt.
-    private static func keychain() -> String? {
-        let query: [String: Any] = [
+    private static func keychain(interactive: Bool) -> (String?, OSStatus) {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecReturnData as String: true,
         ]
+        if !interactive {
+            query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+            // Legacy (file-based) keychain ACL prompts ignore the flag above;
+            // this process-wide switch suppresses them too.
+            SecKeychainSetUserInteractionAllowed(false)
+        }
+        defer { if !interactive { SecKeychainSetUserInteractionAllowed(true) } }
         var out: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
-              let data = out as? Data else { return nil }
-        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let st = SecItemCopyMatching(query as CFDictionary, &out)
+        guard st == errSecSuccess, let data = out as? Data else { return (nil, st) }
+        return (String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), st)
     }
 
     private static func parse(_ s: String) -> Creds? {
@@ -834,7 +868,9 @@ struct MeterView: View {
         .contentShape(shape)
         .help(store.updatedAt.map { "Updated \($0.formatted(date: .omitted, time: .standard))" } ?? "")
         .contextMenu {
-            Button("Refresh") { store.refresh() }
+            Button(store.needsKeychainApproval ? "Allow Keychain Access…" : "Refresh") {
+                store.refresh(interactive: true)
+            }
             Button(SMAppService.mainApp.status == .enabled ? "✓ Launch at Login" : "Launch at Login") { toggleLogin() }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
