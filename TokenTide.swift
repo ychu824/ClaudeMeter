@@ -383,6 +383,7 @@ final class Store: ObservableObject {
     private var busy = false
     private var notBefore = Date.distantPast           // backoff after a 429
     private static let cacheKey = "TokenTide.limits"   // minimal: [{id, pct, resetsAt}]
+    private static let cacheTimeKey = "TokenTide.limitsAt"
     private var scanning = false
     private let logIndex = LogIndex()
 
@@ -405,6 +406,8 @@ final class Store: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: Self.cacheKey),
            let cached = try? JSONDecoder().decode([UsageWindow].self, from: data) {
             windows = cached
+            updatedAt = UserDefaults.standard.object(forKey: Self.cacheTimeKey) as? Date
+            expireWindows()
         }
         refresh()
         scanTokens()
@@ -414,8 +417,27 @@ final class Store: ObservableObject {
         }
         // Local logs: cheap incremental tail, so poll often.
         tokenTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.scanTokens() }
+            Task { @MainActor in
+                self?.expireWindows()
+                self?.scanTokens()
+            }
         }
+    }
+
+    // A window whose reset time has passed is, by definition, fresh again. Show it as
+    // 0% used instead of the stale pre-reset number, and fetch the new state.
+    private func expireWindows() {
+        let now = Date()
+        guard windows.contains(where: { ($0.resetsAt ?? .distantFuture) <= now }) else { return }
+        windows = windows.map { w in
+            (w.resetsAt ?? .distantFuture) <= now ? UsageWindow(id: w.id, pct: 0, resetsAt: nil) : w
+        }
+        refresh()
+    }
+
+    private func staleSuffix() -> String {
+        guard let u = updatedAt else { return "" }
+        return " · data from \(u.formatted(date: .omitted, time: .shortened))"
     }
 
     // force = the user chose Refresh; skips the 429 backoff.
@@ -451,6 +473,7 @@ final class Store: ObservableObject {
                 // Cache only what's displayed — never the raw response.
                 if !w.isEmpty, let enc = try? JSONEncoder().encode(w) {
                     UserDefaults.standard.set(enc, forKey: Self.cacheKey)
+                    UserDefaults.standard.set(Date(), forKey: Self.cacheTimeKey)
                 }
                 if plan == nil && !profileTried {
                     profileTried = true
@@ -460,18 +483,18 @@ final class Store: ObservableObject {
                 status = w.isEmpty ? "No limit fields in response (API changed?)" : nil
             case 401, 403:
                 token = nil   // re-read Keychain next round; Claude Code refreshes it when used
-                status = "Token expired — open Claude Code to refresh"
+                status = "Token expired — open Claude Code to refresh" + staleSuffix()
             case 429:
                 // Honor Retry-After (seconds), at least 2 minutes. Keep showing the
-                // cached numbers; only complain if there's nothing to show.
-                let ra = resp.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0
-                notBefore = Date().addingTimeInterval(max(ra, 120))
-                status = windows.isEmpty ? "Rate limited, retrying in \(Int(max(ra, 120) / 60)) min" : nil
+                // cached numbers, but always say they're stale.
+                let wait = max(resp.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0, 120)
+                notBefore = Date().addingTimeInterval(wait)
+                status = "Rate limited, retry in \(Int((wait / 60).rounded(.up))) min" + staleSuffix()
             default:
-                status = "HTTP \(code)"
+                status = "HTTP \(code)" + staleSuffix()
             }
         } catch {
-            status = "Network error"
+            status = "Network error" + staleSuffix()
         }
     }
 
