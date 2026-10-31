@@ -51,23 +51,12 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-# Prefer your Developer ID even for local builds: the Keychain "Always Allow"
-# grant is tied to the code signature, and an ad-hoc signature changes on every
-# build, which would re-trigger the permission prompt after each rebuild.
-# Set SIGN_ID=- to force ad-hoc.
-if [[ -z "${SIGN_ID:-}" ]]; then
-  SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null \
-             | grep -m1 'Developer ID Application' | sed -E 's/.*"(.*)"/\1/' || true)"
-fi
-[[ "${SIGN_ID:-}" == "-" ]] && SIGN_ID=""
-
 if [[ -n "${SIGN_ID:-}" ]]; then
   echo "Signing with: $SIGN_ID"
   # Hardened runtime + secure timestamp are required for notarization.
   codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$APP"
   codesign --verify --strict --verbose=2 "$APP"
 else
-  echo "Signing ad-hoc (no Developer ID identity found). Keychain will re-prompt after each rebuild."
   codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 fi
 

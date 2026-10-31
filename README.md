@@ -29,7 +29,7 @@ git clone https://github.com/ychu824/TokenTide.git && cd TokenTide
 
 You need **macOS 13+** and [Claude Code](https://claude.com/claude-code), signed in at least once, because TokenTide reuses its login.
 
-On first launch, macOS asks whether **TokenTide** may use the `Claude Code-credentials` Keychain item. Choose **Always Allow**. To start it automatically, right-click the widget → **Launch at Login**.
+To start it automatically, right-click the widget and choose **Launch at Login**.
 
 ## Security & privacy
 
@@ -37,7 +37,7 @@ TokenTide reads the OAuth token Claude Code keeps in your Keychain, so it's buil
 
 - **Only talks to `api.anthropic.com`.** HTTPS only, ephemeral session, redirects refused. There's no analytics, telemetry or update checker.
 - **The token stays in memory.** It's never logged, shown or written to disk, and TokenTide never refreshes or modifies it.
-- **The Keychain grant is scoped to TokenTide's signature,** not to a shared CLI tool.
+- **Reads the token the same way Claude Code does,** so there are no extra prompts, and it adds no new access path.
 - **Stores almost nothing:** the widget position and the last limit percentages and reset times. It never stores the raw API response.
 - **One file to audit.** The entire app is `TokenTide.swift`.
 - **Verifiable builds.** Releases are built, signed and notarized by GitHub Actions from the tagged source, with a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations):
@@ -75,7 +75,6 @@ The widget floats above every window, on every Space and over full-screen apps. 
 ## Caveats
 
 - `/api/oauth/usage` and `/api/oauth/profile` are **undocumented** endpoints and may change without notice.
-- If Claude Code re-creates its Keychain item, macOS may ask once more for permission.
 
 ## Contributing
 

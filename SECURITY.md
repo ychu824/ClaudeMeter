@@ -6,7 +6,7 @@ TokenTide reads an OAuth token that can act on your Claude account, so here is e
 
 | Resource | Access | Why |
 |---|---|---|
-| Keychain item `Claude Code-credentials` | read | To get the OAuth access token and plan tier that Claude Code stored |
+| Keychain item `Claude Code-credentials` (via `/usr/bin/security`) | read | To get the OAuth access token and plan tier that Claude Code stored |
 | `~/.claude/projects/**/*.jsonl` | read | To get Claude Code token counts and the model mix |
 | `https://api.anthropic.com/api/oauth/usage` and `/api/oauth/profile` | HTTPS GET | To get limit percentages, reset times and the plan |
 | App `UserDefaults` (`io.github.ychu824.TokenTide`) | read and write | Stores the widget position and the last limit percentages and reset times |
@@ -15,8 +15,7 @@ TokenTide reads an OAuth token that can act on your Claude account, so here is e
 
 ## How the token is protected
 
-- **Scoped Keychain grant.** TokenTide reads the token through the Security framework, so the macOS prompt and your *Always Allow* apply only to TokenTide's code signature. Release builds are signed with a Developer ID, so the grant survives updates. Earlier versions shelled out to `/usr/bin/security`, and granting *that* would have let any process read the token silently. If you allowed it back then, remove `security` from the item's access list in **Keychain Access → Claude Code-credentials → Access Control**.
-- **No surprise prompts.** Background refreshes read the Keychain non-interactively. If macOS would need to ask (for example after Claude Code re-creates its Keychain item), the widget shows a status line instead, and the dialog appears only when you choose **Allow Keychain Access…** from the right-click menu. The token is read once and re-read only after a 401.
+- **Same Keychain access as Claude Code.** TokenTide reads the item with `security find-generic-password`, exactly as Claude Code does. The item's access list already trusts that tool, so there's no extra prompt. This means any process running as you can read this token the same way. That's a property of how Claude Code stores it, and TokenTide neither widens nor narrows it.
 - **Kept in memory only.** The token is never logged, displayed, written to disk or put into a URL. Error messages never include it.
 - **One host.** All requests go through a single function (`Net.get` in `TokenTide.swift`). It builds URLs only for `https://api.anthropic.com` and uses an *ephemeral* `URLSession`, which means no disk cache, no cookies and no credential storage. It refuses redirects, so the `Authorization` header can't be forwarded to another host, and it rejects any response that doesn't come from that host.
 - **No token refresh.** TokenTide never refreshes or rewrites the token, so it can't corrupt Claude Code's stored credentials.
