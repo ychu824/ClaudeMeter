@@ -28,6 +28,9 @@ jobs:
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: |
           set -euo pipefail
+          if [ -z "$MACOS_CERT_P12" ] || [ -z "$MACOS_CERT_PASSWORD" ]; then
+            echo "::error::Secrets MACOS_CERT_P12 / MACOS_CERT_PASSWORD are not set (see docs/RELEASING.md)"; exit 1
+          fi
           KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
           KC_PW="$(uuidgen)"
           echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
@@ -41,7 +44,7 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12"
           ID="$(security find-identity -v -p codesigning "$KEYCHAIN" \
                 | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)"/\1/')"
-          test -n "$ID" || { echo "No Developer ID Application identity in the certificate"; exit 1; }
+          test -n "$ID" || { echo "::error::The .p12 has no Developer ID Application identity (export the certificate *with* its private key)"; exit 1; }
           echo "SIGN_ID=$ID" >> "$GITHUB_ENV"
 
       - name: Build universal app (signed, hardened runtime)
