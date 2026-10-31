@@ -8,7 +8,7 @@ Pushing a `v*` tag runs `.github/workflows/release.yml`. The workflow:
 4. Attests build provenance.
 5. Publishes a GitHub Release with the zip and `SHA256SUMS.txt`.
 
-## One-time setup: 5 repository secrets
+## One-time setup: repository secrets
 
 Add these under **Settings → Secrets and variables → Actions**, or with `gh secret set`.
 
@@ -16,9 +16,10 @@ Add these under **Settings → Secrets and variables → Actions**, or with `gh 
 |---|---|
 | `MACOS_CERT_P12` | Your **Developer ID Application** certificate and private key, exported as `.p12` and base64-encoded |
 | `MACOS_CERT_PASSWORD` | The password you set when exporting the `.p12` |
-| `NOTARY_KEY_P8` | App Store Connect API key (`.p8`), base64-encoded |
-| `NOTARY_KEY_ID` | That key's Key ID |
-| `NOTARY_ISSUER_ID` | Your Issuer ID, shown at the top of the Keys page |
+| **Notarization, option A:** `NOTARY_APPLE_ID`, `NOTARY_PASSWORD`, `NOTARY_TEAM_ID` | Your Apple ID email, an **app-specific password**, and your Team ID |
+| **Notarization, option B:** `NOTARY_KEY_P8`, `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID` | An App Store Connect API key (`.p8`, base64-encoded), its Key ID, and your Issuer ID |
+
+Set **one** of the two notarization options. If both are set, the API key wins.
 
 ### 1. Developer ID certificate
 
@@ -35,7 +36,20 @@ gh secret set MACOS_CERT_PASSWORD --repo ychu824/TokenTide   # paste the passwor
 rm cert.p12
 ```
 
-### 2. Notarization API key
+### 2a. Notarization with an app-specific password (simplest)
+
+1. Go to account.apple.com → **Sign-In and Security → App-Specific Passwords → +**, name it `TokenTide notarization`, and copy the password.
+2. Upload it with your Apple ID and Team ID:
+
+```bash
+gh secret set NOTARY_APPLE_ID --repo ychu824/TokenTide   # the Apple ID email of your developer account
+gh secret set NOTARY_PASSWORD --repo ychu824/TokenTide   # paste the app-specific password
+gh secret set NOTARY_TEAM_ID  --repo ychu824/TokenTide   # e.g. H63486AZ9Y
+```
+
+You can revoke the password at any time from the same page.
+
+### 2b. Notarization with an API key (alternative)
 
 1. Go to App Store Connect → **Users and Access → Integrations → App Store Connect API → Team Keys → +**.
 2. Choose the **Developer** role and download the `.p8`. Apple only lets you download it once.

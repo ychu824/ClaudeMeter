@@ -48,16 +48,27 @@ jobs:
         run: VERSION="${TAG#v}" UNIVERSAL=1 ./build.sh
 
       - name: Notarize and staple
+        # Either an App Store Connect API key (NOTARY_KEY_P8/ID/ISSUER_ID) or an
+        # Apple ID + app-specific password (NOTARY_APPLE_ID/PASSWORD/TEAM_ID).
         env:
           NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
           NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
         run: |
           set -euo pipefail
-          echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          if [ -n "$NOTARY_KEY_P8" ]; then
+            echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+            AUTH=(--key "$RUNNER_TEMP/notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID")
+          elif [ -n "$NOTARY_APPLE_ID" ]; then
+            AUTH=(--apple-id "$NOTARY_APPLE_ID" --password "$NOTARY_PASSWORD" --team-id "$NOTARY_TEAM_ID")
+          else
+            echo "No notarization credentials configured (see docs/RELEASING.md)"; exit 1
+          fi
           ditto -c -k --keepParent TokenTide.app "$RUNNER_TEMP/submit.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/submit.zip" \
-            --key "$RUNNER_TEMP/notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+          xcrun notarytool submit "$RUNNER_TEMP/submit.zip" "${AUTH[@]}" \
             --wait --timeout 20m --output-format json | tee "$RUNNER_TEMP/notary.json"
           rm -f "$RUNNER_TEMP/notary.p8"
           STATUS="$(jq -r .status "$RUNNER_TEMP/notary.json")"
