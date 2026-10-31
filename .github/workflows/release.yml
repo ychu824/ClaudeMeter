@@ -71,8 +71,17 @@ jobs:
             echo "No notarization credentials configured (see docs/RELEASING.md)"; exit 1
           fi
           ditto -c -k --keepParent TokenTide.app "$RUNNER_TEMP/submit.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/submit.zip" "${AUTH[@]}" \
-            --wait --timeout 20m --output-format json | tee "$RUNNER_TEMP/notary.json"
+          # Apple's notary service returns transient 5xx now and then; retry with backoff.
+          for i in 1 2 3 4; do
+            if xcrun notarytool submit "$RUNNER_TEMP/submit.zip" "${AUTH[@]}" \
+                 --wait --timeout 20m --output-format json > "$RUNNER_TEMP/notary.json"; then
+              break
+            fi
+            cat "$RUNNER_TEMP/notary.json" || true
+            [ "$i" = 4 ] && { echo "::error::notarytool failed 4 times"; exit 1; }
+            echo "notarytool failed (attempt $i), retrying in $((i * 30))s"; sleep $((i * 30))
+          done
+          cat "$RUNNER_TEMP/notary.json"
           rm -f "$RUNNER_TEMP/notary.p8"
           STATUS="$(jq -r .status "$RUNNER_TEMP/notary.json")"
           if [ "$STATUS" != "Accepted" ]; then
