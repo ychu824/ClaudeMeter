@@ -2,11 +2,7 @@
 
 A tiny always-on-top macOS widget that shows how much of your Claude plan is left.
 
-<p>
-  <img src="docs/collapsed.png" height="110" alt="Collapsed: ring gauge">
-  &nbsp;&nbsp;
-  <img src="docs/expanded.png" height="160" alt="Expanded on hover: full panel">
-</p>
+<p align="center"><img src="docs/demo.gif" width="420" alt="TokenTide: a ring gauge that expands into a usage panel on hover"></p>
 
 **At rest** it's a small clay-tinted circle with two rings:
 
