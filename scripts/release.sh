@@ -13,6 +13,10 @@
 # Needs: Xcode Command Line Tools, a "Developer ID Application" identity in your
 # keychain, and gh (authenticated).
 set -euo pipefail
+# Everything runs inside main(), which bash parses in full before executing.
+# That matters because we `git checkout` the tag below, which can change or
+# remove this very file while it's running.
+main() {
 cd "$(dirname "$0")/.."
 
 TAG="${1:?usage: scripts/release.sh vX.Y.Z}"
@@ -62,3 +66,5 @@ else
   gh release create "$TAG" "$ZIP" SHA256SUMS.txt --repo "$REPO" --title "TokenTide $TAG" --generate-notes
 fi
 echo "Done: https://github.com/$REPO/releases/tag/$TAG"
+}
+main "$@"
