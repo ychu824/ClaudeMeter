@@ -1,0 +1,91 @@
+# Builds, signs (Developer ID), notarizes and publishes TokenTide on every v* tag.
+# Required repo secrets: see docs/RELEASING.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write        # create the GitHub Release
+  id-token: write        # build provenance attestation
+  attestations: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # build number = commit count
+
+      - name: Import Developer ID certificate into a throwaway keychain
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KC_PW="$(uuidgen)"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" \
+            -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          ID="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+                | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)"/\1/')"
+          test -n "$ID" || { echo "No Developer ID Application identity in the certificate"; exit 1; }
+          echo "SIGN_ID=$ID" >> "$GITHUB_ENV"
+
+      - name: Build universal app (signed, hardened runtime)
+        run: VERSION="${TAG#v}" UNIVERSAL=1 ./build.sh
+
+      - name: Notarize and staple
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent TokenTide.app "$RUNNER_TEMP/submit.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/submit.zip" \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 20m --output-format json | tee "$RUNNER_TEMP/notary.json"
+          rm -f "$RUNNER_TEMP/notary.p8"
+          STATUS="$(jq -r .status "$RUNNER_TEMP/notary.json")"
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "Notarization status: $STATUS"; exit 1
+          fi
+          xcrun stapler staple TokenTide.app
+          spctl --assess --type execute --verbose=2 TokenTide.app
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent TokenTide.app "TokenTide-$TAG.zip"
+          shasum -a 256 "TokenTide-$TAG.zip" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: TokenTide-${{ github.ref_name }}.zip
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" "TokenTide-$TAG.zip" SHA256SUMS.txt \
+            --title "TokenTide $TAG" --generate-notes
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true

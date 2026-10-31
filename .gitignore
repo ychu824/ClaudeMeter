@@ -1,6 +1,7 @@
 # Build output
-ClaudeMeter.app/
-*.o
+TokenTide.app/
+.build/
+*.zip
 *.dSYM/
 
 # macOS

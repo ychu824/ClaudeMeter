@@ -1,4 +1,16 @@
-// ClaudeMeter — tiny always-on-top Claude usage meter for macOS 13+.
+// TokenTide — tiny always-on-top meter for your Claude plan usage, macOS 13+.
+// Unofficial; not affiliated with or endorsed by Anthropic.
+//
+// Security model (see SECURITY.md):
+//   - Reads Claude Code's OAuth token from the Keychain with the Security framework,
+//     so the macOS "Always Allow" grant is scoped to this app's code signature
+//     (not to /usr/bin/security, which any process can run).
+//   - The token lives only in memory. It is never logged, displayed or written.
+//   - The only network peer is https://api.anthropic.com. The URL session is
+//     ephemeral (no disk cache, no cookies) and refuses redirects, so the
+//     Authorization header can't be forwarded to another host.
+//   - Persisted state (UserDefaults): widget position, and the last limit
+//     percentages + reset times. Nothing else.
 //
 // Data sources:
 //   1. Plan limits (% used / reset time): GET https://api.anthropic.com/api/oauth/usage
@@ -18,9 +30,10 @@ import AppKit
 import Combine
 import QuartzCore
 import ServiceManagement
+import Security
 
 @main
-struct ClaudeMeterApp: App {
+struct TokenTideApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     var body: some Scene { Settings { EmptyView() } }
 }
@@ -85,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowIsExpanded = false
     private var programmaticMove = false
     private var gen = 0
-    private static let homeKey = "ClaudeMeter.home"
+    private static let homeKey = "TokenTide.home"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon, no menu bar
@@ -284,7 +297,7 @@ enum Corner {
 
 // MARK: - Model
 
-struct UsageWindow: Identifiable {
+struct UsageWindow: Identifiable, Codable {
     let id: String          // API key, e.g. "five_hour"
     let pct: Double         // % used, 0–100
     let resetsAt: Date?
@@ -371,7 +384,7 @@ final class Store: ObservableObject {
     private var tokenTimer: Timer?
     private var busy = false
     private var notBefore = Date.distantPast           // backoff after a 429
-    private static let cacheKey = "ClaudeMeter.lastUsage"
+    private static let cacheKey = "TokenTide.limits"   // minimal: [{id, pct, resetsAt}]
     private var scanning = false
     private let logIndex = LogIndex()
 
@@ -392,8 +405,8 @@ final class Store: ObservableObject {
         // Show the last good response immediately (reset times are absolute, so
         // they stay correct); relaunching no longer means a blank widget.
         if let data = UserDefaults.standard.data(forKey: Self.cacheKey),
-           let obj = try? JSONSerialization.jsonObject(with: data) {
-            windows = Parser.windows(from: obj)
+           let cached = try? JSONDecoder().decode([UsageWindow].self, from: data) {
+            windows = cached
         }
         refresh()
         scanTokens()
@@ -428,19 +441,17 @@ final class Store: ObservableObject {
             status = "No Claude Code login — run `claude` once"
             return
         }
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
-        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.timeoutInterval = 15
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let (data, resp) = try await Net.get("/api/oauth/usage", token: t)
+            let code = resp.statusCode
             switch code {
             case 200:
                 let w = Parser.windows(from: try JSONSerialization.jsonObject(with: data))
                 windows = w
-                if !w.isEmpty { UserDefaults.standard.set(data, forKey: Self.cacheKey) }
+                // Cache only what's displayed — never the raw response.
+                if !w.isEmpty, let enc = try? JSONEncoder().encode(w) {
+                    UserDefaults.standard.set(enc, forKey: Self.cacheKey)
+                }
                 if plan == nil && !profileTried {
                     profileTried = true
                     plan = await Profile.plan(token: t)
@@ -453,7 +464,7 @@ final class Store: ObservableObject {
             case 429:
                 // Honor Retry-After (seconds), at least 2 minutes. Keep showing the
                 // cached numbers; only complain if there's nothing to show.
-                let ra = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0
+                let ra = resp.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0
                 notBefore = Date().addingTimeInterval(max(ra, 120))
                 status = windows.isEmpty ? "Rate limited, retrying in \(Int(max(ra, 120) / 60)) min" : nil
             default:
@@ -519,17 +530,19 @@ enum Credentials {
         return s.isEmpty ? nil : s.capitalized
     }
 
+    // Security framework, not /usr/bin/security: the user's "Always Allow" then
+    // applies to TokenTide's code signature only. Granting it to the `security`
+    // CLI would let any process on the machine read the token without a prompt.
     private static func keychain() -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return nil }
-        let data = out.fileHandleForReading.readDataToEndOfFile()   // read before wait: no pipe deadlock
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return nil }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnData as String: true,
+        ]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
+              let data = out as? Data else { return nil }
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -544,16 +557,56 @@ enum Credentials {
     }
 }
 
-// Fallback when the stored credentials carry no plan fields.
-enum Profile {
-    static func plan(token: String) async -> String? {
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/profile")!)
+// MARK: - Network
+
+// The only code that talks to the network. One host, HTTPS only, ephemeral session
+// (no disk cache, cookies or credential storage), redirects refused.
+enum Net {
+    static let host = "api.anthropic.com"
+
+    private final class NoRedirects: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
+    private static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.urlCache = nil
+        c.httpCookieStorage = nil
+        c.httpShouldSetCookies = false
+        c.urlCredentialStorage = nil
+        c.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        c.timeoutIntervalForRequest = 15
+        return URLSession(configuration: c, delegate: NoRedirects(), delegateQueue: nil)
+    }()
+
+    static func get(_ path: String, token: String) async throws -> (Data, HTTPURLResponse) {
+        var comps = URLComponents()
+        comps.scheme = "https"
+        comps.host = host
+        comps.path = path
+        guard let url = comps.url else { throw URLError(.badURL) }
+        var req = URLRequest(url: url)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.timeoutInterval = 15
-        guard let r = try? await URLSession.shared.data(for: req),
-              (r.1 as? HTTPURLResponse)?.statusCode == 200,
+        let (data, resp) = try await session.data(for: req)
+        guard let http = resp as? HTTPURLResponse, http.url?.host == host else {
+            throw URLError(.badServerResponse)
+        }
+        return (data, http)
+    }
+}
+
+// Fallback when the stored credentials carry no plan fields.
+enum Profile {
+    static func plan(token: String) async -> String? {
+        guard let r = try? await Net.get("/api/oauth/profile", token: token),
+              r.1.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: r.0) else { return nil }
         var found: [String: String] = [:]
         collect(obj, &found)
