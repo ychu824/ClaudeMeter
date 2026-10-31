@@ -1,3 +1,5 @@
+<img src="assets/AppIcon.png" width="96" align="left" alt="TokenTide icon">
+
 # TokenTide
 
 A tiny always-on-top macOS widget that shows how much of your Claude plan is left.
